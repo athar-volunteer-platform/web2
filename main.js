@@ -4,6 +4,19 @@
  * حسابات الإدارة حسب الكليات محددة مسبقاً داخل COLLEGE_CATALOG
  */
 
+// NEW: Firebase config (replaces IndexedDB persistence)
+// ملاحظة: هذه القيم مأخوذة من إعدادات مشروع Firebase الخاص بمنصة أثر.
+const FIREBASE_CONFIG = {
+    apiKey: "AIzaSyDaiuEKnbGLpRO03u7ya66TyaOcBvnVR3w",
+    authDomain: "athar-6c851.firebaseapp.com",
+    projectId: "athar-6c851",
+    storageBucket: "athar-6c851.firebasestorage.app",
+    messagingSenderId: "634015253931",
+    appId: "1:634015253931:web:4a8da39913fe4142a57eee",
+    measurementId: "G-199H1D8DHH",
+};
+
+// Legacy constants kept for backwards compatibility in the codebase.
 const IDB_NAME = "athar_db";
 const IDB_VERSION = 7;
 const USERS_STORE = "users";
@@ -119,6 +132,14 @@ let eventMembersExpandedState = new Map();
 let forgotPasswordVerifiedEmail = "";
 let forgotPasswordVerifiedUserId = "";
 
+// NEW: Firebase singletons (Auth used for OTP + Firestore used as DB)
+let firebaseAppInstance = null;
+let firebasePhoneAuth = null;
+let firebaseRecaptchaVerifier = null;
+let firebaseConfirmationResult = null;
+let firebaseFirestore = null;
+let firebaseFirestoreSettingsApplied = false;
+
 /** كلية الفعاليات المعروضة حالياً */
 let currentCollegeForEvents = "";
 let currentEventChatId = "";
@@ -168,6 +189,18 @@ function showMfaManageStatus(msg, isError = false) {
 
 function showLoader(v) {
     document.getElementById("loader").style.display = v ? "flex" : "none";
+}
+
+// NEW: small helper to prevent endless loaders on network hangs.
+function withTimeout(promise, ms, label = "operation") {
+    const timeoutMs = Number.isFinite(ms) && ms > 0 ? ms : 15000;
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => {
+            const err = new Error(`timeout:${label}`);
+            setTimeout(() => reject(err), timeoutMs);
+        }),
+    ]);
 }
 
 function getEventMembersExpandedStorageKey(college = currentCollegeForEvents) {
@@ -806,272 +839,178 @@ function setupDbSync() {
     });
 }
 
-function openIdb() {
-    if (idbConnection) return Promise.resolve(idbConnection);
+// NEW: Firestore-backed persistence. We keep the same function names to avoid
+// touching the rest of the app (including `mfa.js`) while removing IndexedDB.
 
-    return new Promise((resolve, reject) => {
-        if (!window.indexedDB) {
-            reject(new Error("IndexedDB غير متاح"));
-            return;
+function ensureFirebaseCore() {
+    // Firebase web SDK generally does not work reliably when opened as file://
+    // because it needs a proper origin for auth/storage and some APIs.
+    if (typeof location !== "undefined" && location.protocol === "file:") {
+        throw new Error("firebase-file-protocol-not-supported");
+    }
+    if (!window.firebase || !window.firebase.initializeApp) {
+        throw new Error("firebase-sdk-missing");
+    }
+    if (!isFirebaseConfigReady()) {
+        throw new Error("firebase-config-missing");
+    }
+    if (!firebaseAppInstance) {
+        firebaseAppInstance = window.firebase.apps.length
+            ? window.firebase.app()
+            : window.firebase.initializeApp(FIREBASE_CONFIG);
+    }
+    if (!firebaseFirestore) {
+        if (!firebaseAppInstance.firestore) {
+            throw new Error("firebase-firestore-sdk-missing");
         }
-        const req = indexedDB.open(IDB_NAME, IDB_VERSION);
-        req.onerror = () => {
-            const err = req.error;
-            if (err && (err.name === "VersionError" || err.name === "InvalidStateError")) {
-                // Existing DB has higher version; open without version to use current DB
-                const fallback = indexedDB.open(IDB_NAME);
-                fallback.onerror = () => reject(fallback.error);
-                fallback.onsuccess = () => {
-                    idbConnection = fallback.result;
-                    idbConnection.onclose = () => {
-                        idbConnection = null;
-                    };
-                    resolve(idbConnection);
-                };
-                fallback.onupgradeneeded = (e) => {
-                    const db = e.target.result;
-                    if (!db.objectStoreNames.contains(USERS_STORE)) {
-                        const os = db.createObjectStore(USERS_STORE, { keyPath: "uid" });
-                        os.createIndex("by_email", "email", { unique: true });
-                    }
-                    if (!db.objectStoreNames.contains(EVENTS_STORE)) {
-                        db.createObjectStore(EVENTS_STORE, { keyPath: "id" });
-                    }
-                    if (!db.objectStoreNames.contains(REQUESTS_STORE)) {
-                        db.createObjectStore(REQUESTS_STORE, { keyPath: "id" });
-                    }
-                    if (!db.objectStoreNames.contains(CHATS_STORE)) {
-                        db.createObjectStore(CHATS_STORE, { keyPath: "id" });
-                    }
-                    if (!db.objectStoreNames.contains(MFA_STORE)) {
-                        const os2 = db.createObjectStore(MFA_STORE, { keyPath: "userId" });
-                        os2.createIndex("by_userId", "userId", { unique: true });
-                    }
-                };
-                return;
-            }
-            reject(err);
-        };
-        req.onsuccess = () => {
-            idbConnection = req.result;
-            idbConnection.onclose = () => {
-                idbConnection = null;
-            };
-            resolve(idbConnection);
-        };
-        req.onupgradeneeded = (e) => {
-            const db = e.target.result;
-            if (!db.objectStoreNames.contains(USERS_STORE)) {
-                const os = db.createObjectStore(USERS_STORE, { keyPath: "uid" });
-                os.createIndex("by_email", "email", { unique: true });
-            }
-            if (!db.objectStoreNames.contains(EVENTS_STORE)) {
-                db.createObjectStore(EVENTS_STORE, { keyPath: "id" });
-            }
-            if (!db.objectStoreNames.contains(REQUESTS_STORE)) {
-                db.createObjectStore(REQUESTS_STORE, { keyPath: "id" });
-            }
-            if (!db.objectStoreNames.contains(CHATS_STORE)) {
-                db.createObjectStore(CHATS_STORE, { keyPath: "id" });
-            }
-            if (!db.objectStoreNames.contains(MFA_STORE)) {
-                const os = db.createObjectStore(MFA_STORE, { keyPath: "userId" });
-                os.createIndex("by_userId", "userId", { unique: true });
-            }
-        };
-    });
-}
-
-function idbGetAllUsers(db) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(USERS_STORE, "readonly");
-        const r = tx.objectStore(USERS_STORE).getAll();
-        r.onsuccess = () => resolve(r.result || []);
-        r.onerror = () => reject(r.error);
-    });
-}
-
-function idbGetAllEvents(db) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(EVENTS_STORE, "readonly");
-        const r = tx.objectStore(EVENTS_STORE).getAll();
-        r.onsuccess = () => resolve(r.result || []);
-        r.onerror = () => reject(r.error);
-    });
-}
-
-function idbGetAllRequests(db) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(REQUESTS_STORE, "readonly");
-        const r = tx.objectStore(REQUESTS_STORE).getAll();
-        r.onsuccess = () => resolve(r.result || []);
-        r.onerror = () => reject(r.error);
-    });
-}
-
-function idbGetAllChats(db) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(CHATS_STORE, "readonly");
-        const r = tx.objectStore(CHATS_STORE).getAll();
-        r.onsuccess = () => resolve(r.result || []);
-        r.onerror = () => reject(r.error);
-    });
-}
-
-function idbGetMfaRecord(db, userId) {
-    return new Promise(async (resolve, reject) => {
+        firebaseFirestore = firebaseAppInstance.firestore();
+    }
+    // NEW: Force long-polling to avoid hangs in some networks/proxies.
+    if (firebaseFirestore && !firebaseFirestoreSettingsApplied) {
         try {
-            if (!db.objectStoreNames.contains(MFA_STORE)) {
-                // ensure store exists by upgrading DB
-                await ensureMfaStore();
-                db = await openIdb();
-            }
-            const tx = db.transaction(MFA_STORE, "readonly");
-            const r = tx.objectStore(MFA_STORE).get(userId);
-            r.onsuccess = () => resolve(r.result || null);
-            r.onerror = () => reject(r.error);
+            firebaseFirestore.settings({
+                experimentalForceLongPolling: true,
+                useFetchStreams: false,
+            }, { merge: true });
         } catch (err) {
-            reject(err);
+            // settings() can throw if called after first use; ignore.
+        } finally {
+            firebaseFirestoreSettingsApplied = true;
         }
-    });
+    }
+    return firebaseFirestore;
 }
 
-function idbPutMfaRecord(db, record) {
-    return new Promise(async (resolve, reject) => {
-        try {
-            if (!db.objectStoreNames.contains(MFA_STORE)) {
-                await ensureMfaStore();
-                db = await openIdb();
-            }
-            const tx = db.transaction(MFA_STORE, "readwrite");
-            const store = tx.objectStore(MFA_STORE);
-            const r = store.put(record);
-            r.onsuccess = () => {
-                broadcastDbChange();
-                resolve(r.result);
-            };
-            r.onerror = () => reject(r.error);
-        } catch (err) {
-            reject(err);
-        }
-    });
+async function openIdb() {
+    // Backwards-compatible "db handle"
+    ensureFirebaseCore();
+    return { __athar: "firebase" };
 }
 
-function idbDeleteMfaRecord(db, userId) {
-    return new Promise(async (resolve, reject) => {
-        try {
-            if (!db.objectStoreNames.contains(MFA_STORE)) {
-                await ensureMfaStore();
-                db = await openIdb();
-            }
-            const tx = db.transaction(MFA_STORE, "readwrite");
-            const r = tx.objectStore(MFA_STORE).delete(userId);
-            r.onsuccess = () => {
-                broadcastDbChange();
-                resolve();
-            };
-            r.onerror = () => reject(r.error);
-        } catch (err) {
-            reject(err);
+async function firestoreGetAll(collectionName) {
+    const fs = ensureFirebaseCore();
+    const snap = await withTimeout(
+        fs.collection(collectionName).get(),
+        15000,
+        `firestoreGetAll:${collectionName}`
+    );
+    const rows = [];
+    snap.forEach((doc) => rows.push(doc.data()));
+    return rows;
+}
+
+async function firestoreReplaceAll(collectionName, rows, keyField) {
+    const fs = ensureFirebaseCore();
+    const coll = fs.collection(collectionName);
+
+    // 1) delete existing
+    const existing = await withTimeout(
+        coll.get(),
+        15000,
+        `firestoreReplaceAll:list:${collectionName}`
+    );
+    let batch = fs.batch();
+    let opCount = 0;
+    const commits = [];
+
+    existing.forEach((doc) => {
+        batch.delete(doc.ref);
+        opCount += 1;
+        if (opCount >= 450) {
+            commits.push(withTimeout(batch.commit(), 15000, `firestoreReplaceAll:commit:${collectionName}`));
+            batch = fs.batch();
+            opCount = 0;
         }
     });
+
+    // 2) insert new
+    for (const row of rows || []) {
+        const key = String(row?.[keyField] || "").trim();
+        if (!key) continue;
+        batch.set(coll.doc(key), row);
+        opCount += 1;
+        if (opCount >= 450) {
+            commits.push(withTimeout(batch.commit(), 15000, `firestoreReplaceAll:commit:${collectionName}`));
+            batch = fs.batch();
+            opCount = 0;
+        }
+    }
+
+    if (opCount > 0) commits.push(withTimeout(batch.commit(), 15000, `firestoreReplaceAll:commit:${collectionName}`));
+    await Promise.all(commits);
+    broadcastDbChange();
+}
+
+function idbGetAllUsers(_db) {
+    return firestoreGetAll(USERS_STORE);
+}
+
+function idbGetAllEvents(_db) {
+    return firestoreGetAll(EVENTS_STORE);
+}
+
+function idbGetAllRequests(_db) {
+    return firestoreGetAll(REQUESTS_STORE);
+}
+
+function idbGetAllChats(_db) {
+    return firestoreGetAll(CHATS_STORE);
+}
+
+async function idbGetMfaRecord(_db, userId) {
+    const fs = ensureFirebaseCore();
+    const doc = await withTimeout(
+        fs.collection(MFA_STORE).doc(String(userId || "").trim()).get(),
+        15000,
+        "mfa:get"
+    );
+    return doc.exists ? doc.data() : null;
+}
+
+async function idbPutMfaRecord(_db, record) {
+    const fs = ensureFirebaseCore();
+    const userId = String(record?.userId || "").trim();
+    if (!userId) throw new Error("mfa-missing-userId");
+    await withTimeout(
+        fs.collection(MFA_STORE).doc(userId).set(record),
+        15000,
+        "mfa:set"
+    );
+    broadcastDbChange();
+    return userId;
+}
+
+async function idbDeleteMfaRecord(_db, userId) {
+    const fs = ensureFirebaseCore();
+    const key = String(userId || "").trim();
+    if (!key) return;
+    await withTimeout(
+        fs.collection(MFA_STORE).doc(key).delete(),
+        15000,
+        "mfa:delete"
+    );
+    broadcastDbChange();
 }
 
 async function ensureMfaStore() {
-    // Ensure IDB connection exists
-    await ensureIdbInit();
-    let db = await openIdb();
-    if (db.objectStoreNames.contains(MFA_STORE)) return;
-    // Need to upgrade DB to add MFA_STORE
-    const oldVersion = db.version;
-    try {
-        db.close();
-    } catch (e) {}
-    idbConnection = null;
-    const newVersion = oldVersion + 1;
-    return new Promise((resolve, reject) => {
-        const req = indexedDB.open(IDB_NAME, newVersion);
-        req.onupgradeneeded = (e) => {
-            const d = e.target.result;
-            if (!d.objectStoreNames.contains(MFA_STORE)) {
-                d.createObjectStore(MFA_STORE, { keyPath: "userId" });
-            }
-        };
-        req.onsuccess = () => {
-            idbConnection = req.result;
-            idbConnection.onclose = () => { idbConnection = null; };
-            resolve();
-        };
-        req.onerror = () => reject(req.error);
-    });
+    // No-op for Firestore (collection exists implicitly).
+    return;
 }
 
-function idbReplaceAllUsers(db, users) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(USERS_STORE, "readwrite");
-        const store = tx.objectStore(USERS_STORE);
-        store.clear();
-        for (let i = 0; i < users.length; i++) {
-            store.put(users[i]);
-        }
-        tx.oncomplete = () => {
-            broadcastDbChange();
-            resolve();
-        };
-        tx.onerror = () => reject(tx.error);
-        tx.onabort = () => reject(tx.error || new Error("abort"));
-    });
+function idbReplaceAllUsers(_db, users) {
+    return firestoreReplaceAll(USERS_STORE, users, "uid");
 }
 
-function idbReplaceAllEvents(db, events) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(EVENTS_STORE, "readwrite");
-        const store = tx.objectStore(EVENTS_STORE);
-        store.clear();
-        for (let i = 0; i < events.length; i++) {
-            store.put(events[i]);
-        }
-        tx.oncomplete = () => {
-            broadcastDbChange();
-            resolve();
-        };
-        tx.onerror = () => reject(tx.error);
-        tx.onabort = () => reject(tx.error || new Error("abort"));
-    });
+function idbReplaceAllEvents(_db, events) {
+    return firestoreReplaceAll(EVENTS_STORE, events, "id");
 }
 
-function idbReplaceAllRequests(db, requests) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(REQUESTS_STORE, "readwrite");
-        const store = tx.objectStore(REQUESTS_STORE);
-        store.clear();
-        for (let i = 0; i < requests.length; i++) {
-            store.put(requests[i]);
-        }
-        tx.oncomplete = () => {
-            broadcastDbChange();
-            resolve();
-        };
-        tx.onerror = () => reject(tx.error);
-        tx.onabort = () => reject(tx.error || new Error("abort"));
-    });
+function idbReplaceAllRequests(_db, requests) {
+    return firestoreReplaceAll(REQUESTS_STORE, requests, "id");
 }
 
-function idbReplaceAllChats(db, chats) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(CHATS_STORE, "readwrite");
-        const store = tx.objectStore(CHATS_STORE);
-        store.clear();
-        for (let i = 0; i < chats.length; i++) {
-            store.put(chats[i]);
-        }
-        tx.oncomplete = () => {
-            broadcastDbChange();
-            resolve();
-        };
-        tx.onerror = () => reject(tx.error);
-        tx.onabort = () => reject(tx.error || new Error("abort"));
-    });
+function idbReplaceAllChats(_db, chats) {
+    return firestoreReplaceAll(CHATS_STORE, chats, "id");
 }
 
 async function migrateLegacyLocalStorage(db) {
@@ -2181,9 +2120,17 @@ async function handleLogin() {
         startApp();
     } catch (err) {
         console.error(err);
-        showNotification(
-            "تعذّر تسجيل الدخول. تأكدي أن المتصفح يدعم IndexedDB."
-        );
+        const msg = String(err?.message || "");
+        const code = String(err?.code || "").toLowerCase();
+        if (msg.includes("firebase-file-protocol-not-supported")) {
+            showNotification("Firebase لا يعمل عند فتح الصفحة كملف مباشرة. شغّلي المشروع عبر سيرفر محلي (مثل Live Server) ثم أعيدي المحاولة.");
+        } else if (code === "permission-denied" || msg.toLowerCase().includes("permission") || msg.toLowerCase().includes("missing or insufficient permissions")) {
+            showNotification("ليس لديك صلاحية للوصول إلى قاعدة البيانات (Firestore). عدّلي Firestore Rules للسماح بالقراءة/الكتابة أو فعّلي نظام تسجيل دخول Firebase مناسب.");
+        } else if (msg.startsWith("timeout:")) {
+            showNotification("تعذّر الاتصال بقاعدة البيانات (Firebase) خلال الوقت المحدد. تحققي من الإنترنت وصلاحيات Firestore.");
+        } else {
+            showNotification("تعذّر تسجيل الدخول. تحققي من إعداد Firebase وصلاحيات Firestore.");
+        }
     } finally {
         showLoader(false);
     }
@@ -2261,9 +2208,17 @@ async function handleRegister() {
         startApp();
     } catch (err) {
         console.error(err);
-        showNotification(
-            "تعذّر إنشاء الحساب. تأكدي أن المتصفح يدعم IndexedDB."
-        );
+        const msg = String(err?.message || "");
+        const code = String(err?.code || "").toLowerCase();
+        if (msg.includes("firebase-file-protocol-not-supported")) {
+            showNotification("Firebase لا يعمل عند فتح الصفحة كملف مباشرة. شغّلي المشروع عبر سيرفر محلي (مثل Live Server) ثم أعيدي المحاولة.");
+        } else if (code === "permission-denied" || msg.toLowerCase().includes("permission") || msg.toLowerCase().includes("missing or insufficient permissions")) {
+            showNotification("ليس لديك صلاحية للوصول إلى قاعدة البيانات (Firestore). عدّلي Firestore Rules للسماح بالقراءة/الكتابة أو فعّلي نظام تسجيل دخول Firebase مناسب.");
+        } else if (msg.startsWith("timeout:")) {
+            showNotification("تعذّر الاتصال بقاعدة البيانات (Firebase) خلال الوقت المحدد. تحققي من الإنترنت وصلاحيات Firestore.");
+        } else {
+            showNotification("تعذّر إنشاء الحساب. تحققي من إعداد Firebase وصلاحيات Firestore.");
+        }
     } finally {
         showLoader(false);
     }
